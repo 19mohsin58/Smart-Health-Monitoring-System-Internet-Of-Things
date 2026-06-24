@@ -16,6 +16,8 @@
 #include "dev/button-hal.h"
 #include "dev/leds.h"
 #include "os/sys/log.h"
+#include "coap-engine.h"
+#include "coap-blocking-api.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,10 +54,22 @@ static char client_id[32];
 static struct etimer send_timer;
 static struct etimer connect_timer;
 
+/* Global telemetry variables accessed by CoAP resources */
+int heart_rate = 0;
+int alert_active = 0;
+
+/* CoAP client endpoint and configuration */
+#define COAP_SERVER_EP "coap://[fd00::1]:5683"
+static coap_endpoint_t server_ep;
+static uint8_t coap_registered = 0;
+
+/* External CoAP resources definitions */
+extern coap_resource_t res_health_status;
+extern coap_resource_t res_health_actuator;
+
 /* State variables */
 static uint8_t mqtt_connected = 0;
 static uint8_t subscribed = 0;
-static int alert_active = 0;
 static uint8_t registered = 0;
 
 /* Send interval — will change dynamically during adaptation */
@@ -201,9 +215,18 @@ publish_registration(void)
   }
 }
 /*---------------------------------------------------------------------------*/
+static void
+coap_registration_handler(coap_message_t *response)
+{
+  if(response == NULL) {
+    printf("[COAP] Registration request timed out!\n");
+    return;
+  }
+  printf("[COAP] Registered with Cloud Server successfully!\n");
+}
+/*---------------------------------------------------------------------------*/
 PROCESS_THREAD(sensor_node_process, ev, data)
 {
-  static int heart_rate;
   button_hal_button_t *btn;
 
   PROCESS_BEGIN();
@@ -228,6 +251,11 @@ PROCESS_THREAD(sensor_node_process, ev, data)
   mqtt_register(&conn, &sensor_node_process,
                 client_id, mqtt_event_handler,
                 APP_BUFFER_SIZE);
+
+  /* Activate CoAP Resources */
+  coap_activate_resource(&res_health_status, "health/status");
+  coap_activate_resource(&res_health_actuator, "health/actuator");
+  printf("[COAP] Resources activated: /health/status, /health/actuator\n");
 
   /* Wait for network initialization */
   printf("[NET] Waiting for network deployment layers...\n");
@@ -324,7 +352,38 @@ PROCESS_THREAD(sensor_node_process, ev, data)
      * ============================================== */
     else if(ev == PROCESS_EVENT_TIMER && data == &connect_timer) {
 
-      if(!mqtt_connected) {
+      if(!coap_registered) {
+        if(NETSTACK_ROUTING.node_is_reachable()) {
+          printf("[NET] Global RPL Network reachable! Initiating CoAP registration...\n");
+          
+          coap_endpoint_parse(COAP_SERVER_EP, strlen(COAP_SERVER_EP), &server_ep);
+          
+          static coap_message_t coap_req[1];
+          coap_init_message(coap_req, COAP_TYPE_CON, COAP_POST, 0);
+          coap_set_header_uri_path(coap_req, "register");
+          
+          snprintf(app_buffer, APP_BUFFER_SIZE,
+            "{\"node\":\"%s\","
+            "\"type\":\"sensor\","
+            "\"domain\":\"smart-health\","
+            "\"sensor\":\"heart-rate\","
+            "\"protocol\":\"coap\"}",
+            client_id);
+          coap_set_payload(coap_req, (uint8_t *)app_buffer, strlen(app_buffer));
+          
+          printf("[COAP] Sending registration to Cloud Server...\n");
+          COAP_BLOCKING_REQUEST(&server_ep, coap_req, coap_registration_handler);
+          
+          coap_registered = 1;
+          
+          /* Instantly trigger connect timer again to start MQTT */
+          etimer_set(&connect_timer, 0);
+        } else {
+          printf("[NET] Routing path not ready yet. Retrying network diagnostics...\n");
+          etimer_set(&connect_timer, CONNECT_INTERVAL);
+        }
+      }
+      else if(!mqtt_connected) {
         if(NETSTACK_ROUTING.node_is_reachable()) {
           printf("[NET] Global RPL Network reachable! Establishing connection to MQTT broker...\n");
           

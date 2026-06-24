@@ -6,7 +6,11 @@ MAKE_ROUTING = MAKE_ROUTING_RPL_LITE
 MAKE_MAC = MAKE_MAC_CSMA
 
 MODULES += os/net/app-layer/mqtt
+MODULES += os/net/app-layer/coap
+MODULES_REL += ./resources
+
 CFLAGS += -Wno-error -Wno-format
 
 CONTIKI = /home/mohsin/contiki-ng
 include $(CONTIKI)/Makefile.include
+
