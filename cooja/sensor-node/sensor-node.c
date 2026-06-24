@@ -57,6 +57,7 @@ static struct etimer connect_timer;
 /* Global telemetry variables accessed by CoAP resources */
 int heart_rate = 0;
 int alert_active = 0;
+int manual_alert = 0;
 
 /* CoAP client endpoint and configuration */
 #define COAP_SERVER_EP "coap://[fd00::1]:5683"
@@ -281,6 +282,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
 
       if(alert_active == 0) {
         alert_active = 1;
+        manual_alert = 1;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_RED);
         printf("[EMERGENCY] Patient manually triggered alert sequence!\n");
@@ -291,6 +293,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         }
       } else {
         alert_active = 0;
+        manual_alert = 0;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_GREEN);
         printf("[BUTTON] Alert state manually cancelled by operator.\n");
@@ -305,6 +308,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       btn = (button_hal_button_t *)data;
       if(btn->press_duration_seconds >= 3) {
         alert_active = 0;
+        manual_alert = 0;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_GREEN);
         printf("[LONG PRESS] Safety system force reset executed successfully.\n");
@@ -427,15 +431,28 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         printf("[ADAPTATION] Local network congestion risk mitigation. Throttle send rate to: 20s\n");
 
       } else {
-        /* NORMAL STATE RESTORED */
-        alert_active = 0;
-        leds_off(LEDS_ALL);
-        leds_single_on(LEDS_GREEN);
-        printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
-        printf("[LED] GREEN ON\n");
+        /* NORMAL HEART RATE DETECTED */
+        if(manual_alert == 1) {
+          /* Keep alert active and Red LED on due to manual override */
+          alert_active = 1;
+          leds_off(LEDS_ALL);
+          leds_single_on(LEDS_RED);
+          printf("CLASSIFICATION STATUS        : BALANCED OPERATION (MANUAL ALERT ACTIVE)\n");
+          printf("[LED] RED ON (Manual Alert Latch)\n");
+          
+          /* Keep congestion backoff rate since emergency alert is active */
+          send_interval = 20 * CLOCK_SECOND;
+        } else {
+          /* NORMAL STATE RESTORED */
+          alert_active = 0;
+          leds_off(LEDS_ALL);
+          leds_single_on(LEDS_GREEN);
+          printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
+          printf("[LED] GREEN ON\n");
 
-        /* Revert to target nominal operation rate limits */
-        send_interval = SEND_INTERVAL;
+          /* Revert to target nominal operation rate limits */
+          send_interval = SEND_INTERVAL;
+        }
       }
 
       /* Forward tracking update states upstream */
