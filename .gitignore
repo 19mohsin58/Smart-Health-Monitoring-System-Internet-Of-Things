@@ -1,0 +1,13 @@
+# Ignore professor folders
+Righetti/
+Vallati/
+
+# Ignore project requirements PDF
+IoT Project 2026.pdf
+
+# Ignore Contiki-NG build directories (compiled binaries)
+cooja/sensor-node/build/
+cooja/border-router/build/
+cooja/spammer/build/
+*.cooja
+*.mote
