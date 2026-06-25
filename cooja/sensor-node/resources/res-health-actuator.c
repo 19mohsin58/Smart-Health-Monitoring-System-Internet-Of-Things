@@ -4,7 +4,6 @@
 
 /* Extern global variables from sensor-node.c */
 extern int alert_active;
-extern int manual_alert;
 
 /* Log configuration */
 #include "sys/log.h"
@@ -36,14 +35,12 @@ res_post_put_handler(coap_message_t *request, coap_message_t *response, uint8_t 
 
     if(strncmp(mode, "on", len) == 0) {
       alert_active = 1;
-      manual_alert = 1;
       leds_off(LEDS_ALL);
       leds_single_on(LEDS_RED);
       LOG_INFO("[COAP] Actuator alert turned ON (Red LED)\n");
       success = 1;
     } else if(strncmp(mode, "off", len) == 0) {
       alert_active = 0;
-      manual_alert = 0;
       leds_off(LEDS_ALL);
       leds_single_on(LEDS_GREEN);
       LOG_INFO("[COAP] Actuator alert turned OFF (Green LED)\n");

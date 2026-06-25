@@ -57,12 +57,6 @@ static struct etimer connect_timer;
 /* Global telemetry variables accessed by CoAP resources */
 int heart_rate = 0;
 int alert_active = 0;
-int manual_alert = 0;
-
-/* CoAP client endpoint and configuration */
-#define COAP_SERVER_EP "coap://[fd00::1]:5683"
-static coap_endpoint_t server_ep;
-static uint8_t coap_registered = 0;
 
 /* External CoAP resources definitions */
 extern coap_resource_t res_health_status;
@@ -216,16 +210,6 @@ publish_registration(void)
   }
 }
 /*---------------------------------------------------------------------------*/
-static void
-coap_registration_handler(coap_message_t *response)
-{
-  if(response == NULL) {
-    printf("[COAP] Registration request timed out!\n");
-    return;
-  }
-  printf("[COAP] Registered with Cloud Server successfully!\n");
-}
-/*---------------------------------------------------------------------------*/
 PROCESS_THREAD(sensor_node_process, ev, data)
 {
   button_hal_button_t *btn;
@@ -282,7 +266,6 @@ PROCESS_THREAD(sensor_node_process, ev, data)
 
       if(alert_active == 0) {
         alert_active = 1;
-        manual_alert = 1;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_RED);
         printf("[EMERGENCY] Patient manually triggered alert sequence!\n");
@@ -293,7 +276,6 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         }
       } else {
         alert_active = 0;
-        manual_alert = 0;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_GREEN);
         printf("[BUTTON] Alert state manually cancelled by operator.\n");
@@ -308,7 +290,6 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       btn = (button_hal_button_t *)data;
       if(btn->press_duration_seconds >= 3) {
         alert_active = 0;
-        manual_alert = 0;
         leds_off(LEDS_ALL);
         leds_single_on(LEDS_GREEN);
         printf("[LONG PRESS] Safety system force reset executed successfully.\n");
@@ -356,38 +337,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
      * ============================================== */
     else if(ev == PROCESS_EVENT_TIMER && data == &connect_timer) {
 
-      if(!coap_registered) {
-        if(NETSTACK_ROUTING.node_is_reachable()) {
-          printf("[NET] Global RPL Network reachable! Initiating CoAP registration...\n");
-          
-          coap_endpoint_parse(COAP_SERVER_EP, strlen(COAP_SERVER_EP), &server_ep);
-          
-          static coap_message_t coap_req[1];
-          coap_init_message(coap_req, COAP_TYPE_CON, COAP_POST, 0);
-          coap_set_header_uri_path(coap_req, "register");
-          
-          snprintf(app_buffer, APP_BUFFER_SIZE,
-            "{\"node\":\"%s\","
-            "\"type\":\"sensor\","
-            "\"domain\":\"smart-health\","
-            "\"sensor\":\"heart-rate\","
-            "\"protocol\":\"coap\"}",
-            client_id);
-          coap_set_payload(coap_req, (uint8_t *)app_buffer, strlen(app_buffer));
-          
-          printf("[COAP] Sending registration to Cloud Server...\n");
-          COAP_BLOCKING_REQUEST(&server_ep, coap_req, coap_registration_handler);
-          
-          coap_registered = 1;
-          
-          /* Instantly trigger connect timer again to start MQTT */
-          etimer_set(&connect_timer, 0);
-        } else {
-          printf("[NET] Routing path not ready yet. Retrying network diagnostics...\n");
-          etimer_set(&connect_timer, CONNECT_INTERVAL);
-        }
-      }
-      else if(!mqtt_connected) {
+      if(!mqtt_connected) {
         if(NETSTACK_ROUTING.node_is_reachable()) {
           printf("[NET] Global RPL Network reachable! Establishing connection to MQTT broker...\n");
           
@@ -431,28 +381,15 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         printf("[ADAPTATION] Local network congestion risk mitigation. Throttle send rate to: 20s\n");
 
       } else {
-        /* NORMAL HEART RATE DETECTED */
-        if(manual_alert == 1) {
-          /* Keep alert active and Red LED on due to manual override */
-          alert_active = 1;
-          leds_off(LEDS_ALL);
-          leds_single_on(LEDS_RED);
-          printf("CLASSIFICATION STATUS        : BALANCED OPERATION (MANUAL ALERT ACTIVE)\n");
-          printf("[LED] RED ON (Manual Alert Latch)\n");
-          
-          /* Keep congestion backoff rate since emergency alert is active */
-          send_interval = 20 * CLOCK_SECOND;
-        } else {
-          /* NORMAL STATE RESTORED */
-          alert_active = 0;
-          leds_off(LEDS_ALL);
-          leds_single_on(LEDS_GREEN);
-          printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
-          printf("[LED] GREEN ON\n");
+        /* NORMAL STATE RESTORED */
+        alert_active = 0;
+        leds_off(LEDS_ALL);
+        leds_single_on(LEDS_GREEN);
+        printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
+        printf("[LED] GREEN ON\n");
 
-          /* Revert to target nominal operation rate limits */
-          send_interval = SEND_INTERVAL;
-        }
+        /* Revert to target nominal operation rate limits */
+        send_interval = SEND_INTERVAL;
       }
 
       /* Forward tracking update states upstream */
