@@ -1,87 +1,104 @@
 /*
- * Smart Health Sensor Node
- * - Simulates heart rate sensor
- * - Detects anomalies locally
- * - Publishes data via MQTT
- * - Button = patient emergency alert
- * - LEDs = status indicators
+ * ============================================================================
+ *               Smart Health Sensor Node Implementation (sensor-node.c)
+ * ============================================================================
+ *
+ * Objective:
+ *   Firmware running on physical nRF52840 client dongles to simulate patient
+ *   vitals, run local TinyML inference, and interact with the Border Router
+ *   via CoAP and MQTT protocols.
+ *
+ * Key Features & Functions:
+ *   - MAC-to-Patient Mapping: Configures a unique patient profile at boot.
+ *   - Edge TinyML Classifier: Executes on-device Random Forest classifications.
+ *   - Dynamic Backoff (Mechanism 1): Adjusts transmit intervals during alerts.
+ *   - Deadband Filter (Mechanism 2): Suppresses data when channel is congested.
+ *   - CoAP Server Endpoints: Exposes actuator and status diagnostic interfaces.
+ *   - MQTT Publishing/Subscription: Coordinates with cloud-based brokers.
+ * ============================================================================
  */
 
-#include "contiki.h"
-#include "net/routing/routing.h"
-#include "mqtt.h"
-#include "net/ipv6/uip.h"
-#include "net/ipv6/uip-icmp6.h"
-#include "sys/etimer.h"
-#include "dev/button-hal.h"
-#include "dev/leds.h"
-#include "os/sys/log.h"
-#include "coap-engine.h"
-#include "coap-blocking-api.h"
-#include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include "contiki.h"                     /* Core Contiki-NG system library */
+#include "net/routing/routing.h"         /* Mesh routing capabilities (RPL) */
+#include "mqtt.h"                        /* Lightweight MQTT protocol client */
+#include "net/ipv6/uip.h"                /* IPv6 networking stack driver */
+#include "net/ipv6/uip-icmp6.h"          /* Control messages helper */
+#include "sys/etimer.h"                  /* Event timer library for non-blocking wait */
+#include "dev/button-hal.h"              /* Button Hardware Abstraction Layer API */
+#include "dev/leds.h"                    /* Visual indicator hardware controls */
+#include "os/sys/log.h"                  /* Print logging system macros */
+#include "coap-engine.h"                 /* Constrained Application Protocol server engine */
+#include "coap-blocking-api.h"          /* Synchronous CoAP transaction wrappers */
+#include <string.h>                      /* String handling operations */
+#include <stdio.h>                       /* Standard input/output format formatting */
+#include <stdlib.h>                      /* General standard library utilities */
 
 /*---------------------------------------------------------------------------*/
-/* MQTT topics */
-#define STATUS_TOPIC       "health/node/status"
-#define ALERT_TOPIC        "health/node/alert"
-#define ACTUATOR_TOPIC     "health/node/actuator"
-#define REGISTER_TOPIC     "health/node/register"
+/* MQTT Topic Configuration */
+#define STATUS_TOPIC       "health/node/status"     /* Telemetry publishing topic */
+#define ALERT_TOPIC        "health/node/alert"      /* High-priority emergency alerts */
+#define ACTUATOR_TOPIC     "health/node/actuator"   /* Received actuator command topic */
+#define REGISTER_TOPIC     "health/node/register"   /* Dynamic registration handshake */
 
-/* Timing */
-#define SEND_INTERVAL      (5 * CLOCK_SECOND)
-#define CONNECT_INTERVAL   (5 * CLOCK_SECOND)
+/* System Default Timings */
+#define SEND_INTERVAL      (5 * CLOCK_SECOND)       /* Default reporting interval (5s) */
+#define CONNECT_INTERVAL   (5 * CLOCK_SECOND)       /* Connection retry delay (5s) */
 
-/* Buffer sizes */
-#define APP_BUFFER_SIZE    256
+/* Data Buffers */
+#define APP_BUFFER_SIZE    256                      /* Buffer size for building JSON strings */
 
-/* Broker IP Address Configuration */
+/* Default Local IPv6 Gateway Broker Address */
 #define MQTT_CLIENT_BROKER_IP_ADDR "fd00::1"
 /*---------------------------------------------------------------------------*/
 
+/* Declare main process execution thread */
 PROCESS(sensor_node_process, "Health Sensor Node");
 AUTOSTART_PROCESSES(&sensor_node_process);
 
-/* MQTT connection structure */
+/* Persistent connection metadata structure for MQTT driver */
 static struct mqtt_connection conn;
 
-/* Buffers */
+/* Dedicated memory space for telemetry serialization */
 static char app_buffer[APP_BUFFER_SIZE];
 static char client_id[32];
 
-/* Timers */
+/* Non-blocking event timers */
 static struct etimer send_timer;
 static struct etimer connect_timer;
 
-/* Global telemetry variables accessed by CoAP resources */
-int heart_rate = 0;
-int alert_active = 0;
-int congestion_mode = 0;
-static uint32_t seq_id = 0;
-static int last_sent_heart_rate = -1;
-static int last_sent_anomaly = -1;
+/* Send interval duration (will change dynamically during backoff adaptation) */
+static clock_time_t send_interval = SEND_INTERVAL;
 
-#include "heart_disease_model.h"
+/* Vitals & Adaptability State Variables */
+int heart_rate = 0;              /* Simulated patient heart rate */
+int alert_active = 0;            /* Local emergency alert status (1=Active) */
+int congestion_mode = 0;         /* Value-Based suppression mode activated (1=Active) */
+static uint32_t seq_id = 0;      /* Monotonically increasing sequence tracker */
+static int last_sent_heart_rate = -1; /* Previous value to calculate deadband difference */
+static int last_sent_anomaly = -1;    /* Previous anomaly value to monitor status changes */
 
-/* Patient physiological profile for TinyML classification
- * features: [Age, Sex, RestingBP, Cholesterol, FastingBS, MaxHR]
+#include "heart_disease_model.h" /* Inline compiled Andrea's TinyML Random Forest model */
+
+/* 
+ * Patient Physiological Feature Profile Array mapping:
+ * [0: Age, 1: Sex, 2: RestingBP, 3: Cholesterol, 4: FastingBS, 5: MaxHR]
  */
 static float patient_profile[6] = {55.0f, 1.0f, 120.0f, 200.0f, 0.0f, 75.0f};
 
-/* External CoAP resources definitions */
+/* Externally defined CoAP resource structures */
 extern coap_resource_t res_health_status;
 extern coap_resource_t res_health_actuator;
 
-/* State variables */
+/* Internal status flags for network tracking */
 static uint8_t mqtt_connected = 0;
 static uint8_t subscribed = 0;
 static uint8_t registered = 0;
 
-/* Send interval — will change dynamically during adaptation */
-static clock_time_t send_interval = SEND_INTERVAL;
-
 /*---------------------------------------------------------------------------*/
+/*
+ * Name: mqtt_event_handler
+ * Desc: Callback handler processing events dispatched from the Contiki MQTT module.
+ */
 static void
 mqtt_event_handler(struct mqtt_connection *m,
                    mqtt_event_t event,
@@ -90,6 +107,7 @@ mqtt_event_handler(struct mqtt_connection *m,
   switch(event) {
 
   case MQTT_EVENT_CONNECTED:
+    /* MQTT connection established; update states and turn Green LED on */
     printf("[MQTT] Connected to broker!\n");
     mqtt_connected = 1;
     leds_on(LEDS_GREEN);
@@ -97,6 +115,7 @@ mqtt_event_handler(struct mqtt_connection *m,
     break;
 
   case MQTT_EVENT_DISCONNECTED:
+    /* Link lost; clear states, shut down green indicators, and trigger reconnect */
     printf("[MQTT] Disconnected!\n");
     mqtt_connected = 0;
     subscribed = 0;
@@ -105,17 +124,19 @@ mqtt_event_handler(struct mqtt_connection *m,
     break;
 
   case MQTT_EVENT_PUBLISH:
-    /* Command received from cloud broker */
+    /* Triggered if the node receives a direct publish from the broker */
     printf("[MQTT] Command received from cloud!\n");
     leds_on(LEDS_YELLOW);
     break;
 
   case MQTT_EVENT_SUBACK:
+    /* Subscription confirmation packet received */
     printf("[MQTT] Subscription confirmed!\n");
     subscribed = 1;
     break;
 
   case MQTT_EVENT_PUBACK:
+    /* Telemetry packet acknowledge confirmed */
     printf("[MQTT] Publish confirmed!\n");
     break;
 
@@ -145,13 +166,17 @@ mqtt_event_handler(struct mqtt_connection *m,
   }
 }
 /*---------------------------------------------------------------------------*/
+/*
+ * Name: publish_status
+ * Desc: Packages vitals information into JSON and publishes to STATUS_TOPIC.
+ */
 static void
 publish_status(int heart_rate, int anomaly)
 {
-  /* Increment sequence ID on each transmission attempt */
+  /* Increment packet tracker */
   seq_id++;
 
-  /* Format payload directly into a JSON format string */
+  /* Format parameters into serialized JSON string */
   snprintf(app_buffer, APP_BUFFER_SIZE,
     "{\"node\":\"%s\","
     "\"seq\":%lu,"
@@ -164,6 +189,7 @@ publish_status(int heart_rate, int anomaly)
     anomaly,
     alert_active);
 
+  /* Send packet to MQTT library */
   mqtt_status_t status = mqtt_publish(&conn, NULL,
                                       STATUS_TOPIC,
                                       (uint8_t *)app_buffer,
@@ -178,14 +204,20 @@ publish_status(int heart_rate, int anomaly)
   }
 }
 /*---------------------------------------------------------------------------*/
+/*
+ * Name: publish_alert
+ * Desc: Sends high-priority emergency notifications to ALERT_TOPIC.
+ */
 static void
-publish_alert(void)
+publish_alert(const char *type, const char *message)
 {
   snprintf(app_buffer, APP_BUFFER_SIZE,
     "{\"node\":\"%s\","
-    "\"type\":\"EMERGENCY\","
-    "\"message\":\"Patient pressed button!\"}",
-    client_id);
+    "\"type\":\"%s\","
+    "\"message\":\"%s\"}",
+    client_id,
+    type,
+    message);
 
   mqtt_status_t status = mqtt_publish(&conn, NULL,
                                       ALERT_TOPIC,
@@ -195,12 +227,16 @@ publish_alert(void)
                                       MQTT_RETAIN_OFF);
 
   if(status == MQTT_STATUS_OK) {
-    printf("[MQTT] ALERT Published!\n");
+    printf("[MQTT] Published ALERT: %s\n", app_buffer);
   } else {
     printf("[MQTT] ALERT publish failed: %d\n", status);
   }
 }
 /*---------------------------------------------------------------------------*/
+/*
+ * Name: publish_registration
+ * Desc: Handshake registration packet to declare device type and metric parameters.
+ */
 static void
 publish_registration(void)
 {
@@ -226,6 +262,10 @@ publish_registration(void)
   }
 }
 /*---------------------------------------------------------------------------*/
+/*
+ * Name: sensor_node_process
+ * Desc: Core execution loop governing hardware events, timers, and protocols.
+ */
 PROCESS_THREAD(sensor_node_process, ev, data)
 {
   button_hal_button_t *btn;
@@ -236,136 +276,109 @@ PROCESS_THREAD(sensor_node_process, ev, data)
   printf("  Smart Health Node Started\n");
   printf("====================================\n");
 
-  /* Generate uniquely mapped client ID using node link layer identification */
-  snprintf(client_id, sizeof(client_id),
-           "health-node-%02x%02x",
-           linkaddr_node_addr.u8[6],
-           linkaddr_node_addr.u8[7]);
-  printf("Client ID: %s\n", client_id);
+  /* Extract device MAC address for dynamic client configuration mapping */
+  snprintf(client_id, sizeof(client_id), "health-node-%04x", 
+           (unsigned int)(linkaddr_node_addr.u8[LINKADDR_SIZE - 2] << 8 | 
+                          linkaddr_node_addr.u8[LINKADDR_SIZE - 1]));
 
-  /* Assign physiological profile based on Node ID for heterogeneous TinyML testing */
-  uint8_t node_id_last = linkaddr_node_addr.u8[7];
-  if(node_id_last == 2) {
-    // Patient 2: Elderly, high-risk male
-    patient_profile[0] = 72.0f; // Age
-    patient_profile[1] = 1.0f;  // Sex (M)
-    patient_profile[2] = 150.0f; // RestingBP (High)
-    patient_profile[3] = 270.0f; // Cholesterol (High)
-    patient_profile[4] = 1.0f;   // FastingBS (High)
-  } else if(node_id_last == 3) {
-    // Patient 3: Young, healthy female
-    patient_profile[0] = 28.0f; // Age
-    patient_profile[1] = 0.0f;  // Sex (F)
-    patient_profile[2] = 110.0f; // RestingBP
-    patient_profile[3] = 175.0f; // Cholesterol
-    patient_profile[4] = 0.0f;   // FastingBS
-  } else if(node_id_last == 4) {
-    // Patient 4: Middle-aged, moderate-risk male
-    patient_profile[0] = 48.0f; // Age
-    patient_profile[1] = 1.0f;  // Sex (M)
-    patient_profile[2] = 135.0f; // RestingBP
-    patient_profile[3] = 220.0f; // Cholesterol
-    patient_profile[4] = 0.0f;   // FastingBS
+  /* Parse MAC suffix to generate patient risk profiles */
+  uint16_t id_val = (linkaddr_node_addr.u8[LINKADDR_SIZE - 2] << 8 | 
+                     linkaddr_node_addr.u8[LINKADDR_SIZE - 1]);
+
+  /* Profile Customization mappings based on MAC addresses */
+  if (id_val == 0x0002) {
+    /* Patient 2: Elderly High Risk Male */
+    patient_profile[0] = 72.0f;  /* Age */
+    patient_profile[1] = 1.0f;   /* Sex (1=Male) */
+    patient_profile[2] = 150.0f; /* Resting BP */
+    patient_profile[3] = 270.0f; /* Cholesterol */
+    patient_profile[4] = 1.0f;   /* Fasting BS (1=High) */
+  } else if (id_val == 0x0003) {
+    /* Patient 3: Young Low Risk Female */
+    patient_profile[0] = 28.0f;
+    patient_profile[1] = 0.0f;   /* Sex (0=Female) */
+    patient_profile[2] = 110.0f;
+    patient_profile[3] = 175.0f;
+    patient_profile[4] = 0.0f;
+  } else if (id_val == 0x0004) {
+    /* Patient 4: Middle-aged moderate risk male */
+    patient_profile[0] = 48.0f;
+    patient_profile[1] = 1.0f;
+    patient_profile[2] = 135.0f;
+    patient_profile[3] = 220.0f;
+    patient_profile[4] = 0.0f;
   } else {
-    // Default / Patient 5+: Elderly female, moderate risk
-    patient_profile[0] = 65.0f; // Age
-    patient_profile[1] = 0.0f;  // Sex (F)
-    patient_profile[2] = 140.0f; // RestingBP
-    patient_profile[3] = 240.0f; // Cholesterol
-    patient_profile[4] = 1.0f;   // FastingBS
+    /* Default fallback profile: Elderly moderate risk female */
+    patient_profile[0] = 65.0f;
+    patient_profile[1] = 0.0f;
+    patient_profile[2] = 140.0f;
+    patient_profile[3] = 240.0f;
+    patient_profile[4] = 1.0f;
   }
-  printf("TinyML Profile - Age: %d, Sex: %s, RestingBP: %d, Chol: %d, FastingBS: %d\n",
-         (int)patient_profile[0],
-         patient_profile[1] == 1.0f ? "Male" : "Female",
-         (int)patient_profile[2],
-         (int)patient_profile[3],
+
+  /* Safe Integer Cast parsing to avoid floats in libc printf blocks */
+  printf("[PROFILE] Mapping assigned: Age %d, Sex %d, BP %d, Chol %d, FastingBS %d\n",
+         (int)patient_profile[0], (int)patient_profile[1], 
+         (int)patient_profile[2], (int)patient_profile[3], 
          (int)patient_profile[4]);
 
-  /* Clear active hardware indicators initially */
-  leds_off(LEDS_ALL);
-  leds_on(LEDS_GREEN);
-  printf("[LED] GREEN ON - Node initialized\n");
-
-  /* Initialize system MQTT connection registry parameters */
-  mqtt_register(&conn, &sensor_node_process,
-                client_id, mqtt_event_handler,
-                APP_BUFFER_SIZE);
-
-  /* Activate CoAP Resources */
+  /* Start CoAP server engine */
+  coap_engine_init();
+  
+  /* Register status and actuator endpoints */
   coap_activate_resource(&res_health_status, "health/status");
   coap_activate_resource(&res_health_actuator, "health/actuator");
-  printf("[COAP] Resources activated: /health/status, /health/actuator\n");
 
-  /* Wait for network initialization */
-  printf("[NET] Waiting for network deployment layers...\n");
+  /* Setup MQTT client structures */
+  mqtt_register(&conn, &sensor_node_process, client_id, mqtt_event_handler, APP_BUFFER_SIZE);
+
+  /* Set initial non-blocking connection poll timer */
   etimer_set(&connect_timer, CONNECT_INTERVAL);
 
-  /* Core Execution Event Loop Monitoring */
   while(1) {
-    PROCESS_YIELD();
+    PROCESS_YIELD(); /* Suspend thread execution until an event is posted */
 
-    /* ==============================================
-     * BUTTON PRESS LAYER (Visual Event Feedback)
-     * ============================================== */
-    if(ev == button_hal_press_event) {
-      leds_on(LEDS_YELLOW);
-      printf("\n[BUTTON] Patient pressing interaction button...\n");
-    }
-
-    /* ==============================================
-     * BUTTON RELEASE LAYER — Manual Alarm Trigger
-     * ============================================== */
-    else if(ev == button_hal_release_event) {
-      leds_off(LEDS_YELLOW);
-
-      if(alert_active == 0) {
-        alert_active = 1;
+    /* ========================================================
+     * SHORT PRESS INTERACTION — Manual Alert Activation
+     * ======================================================== */
+    if(ev == button_hal_release_event) {
+      alert_active = !alert_active;
+      if(alert_active) {
         leds_off(LEDS_ALL);
         leds_on(LEDS_RED);
-        printf("[EMERGENCY] Patient manually triggered alert sequence!\n");
-        printf("[LED] RED ON - Emergency State Active!\n");
-
-        if(mqtt_connected) {
-          publish_alert();
-        }
+        printf("[BUTTON] Manual alert activated!\n");
+        publish_alert("EMERGENCY", "Patient pressed emergency button!");
       } else {
-        alert_active = 0;
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
-        printf("[BUTTON] Alert state manually cancelled by operator.\n");
-        printf("[LED] GREEN ON - Standard Monitoring Context\n");
+        printf("[BUTTON] Manual alert deactivated.\n");
       }
     }
 
-    /* ==============================================
-     * LONG PRESS INTERACTION — Overriding Faults
-     * ============================================== */
+    /* ========================================================
+     * LONG PRESS INTERACTION — Force Override Safety Reset
+     * ======================================================== */
     else if(ev == button_hal_periodic_event) {
       btn = (button_hal_button_t *)data;
       if(btn->press_duration_seconds >= 3) {
         alert_active = 0;
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
-        printf("[LONG PRESS] Safety system force reset executed successfully.\n");
-        printf("[LED] GREEN ON - System parameters normalized\n");
+        printf("[LONG PRESS] Safety system force reset executed.\n");
       }
     }
 
-    /* ==============================================
-     * MQTT UPDATE EVENT — Handle connection changes
-     * ============================================== */
+    /* ========================================================
+     * MQTT UPDATE EVENT — Handle Network State Transitions
+     * ======================================================== */
     else if(ev == mqtt_update_event) {
       if(mqtt_connected) {
         if(!subscribed) {
           if(conn.out_buffer_sent && !conn.out_queue_full) {
             mqtt_status_t status = mqtt_subscribe(&conn, NULL, ACTUATOR_TOPIC, MQTT_QOS_LEVEL_0);
             if(status == MQTT_STATUS_OK) {
-              printf("[MQTT] Subscription packet enqueued for: %s\n", ACTUATOR_TOPIC);
-            } else {
-              printf("[MQTT] Subscription initiation failed with status: %d\n", status);
+              printf("[MQTT] Subscription packet enqueued: %s\n", ACTUATOR_TOPIC);
             }
-          } else {
-            printf("[MQTT] Output buffer or queue busy. Postponing subscription...\n");
           }
         } else if(!registered) {
           if(!conn.out_queue_full) {
@@ -373,97 +386,83 @@ PROCESS_THREAD(sensor_node_process, ev, data)
             if(registered) {
               etimer_set(&send_timer, send_interval);
             }
-          } else {
-            printf("[MQTT] Queue busy. Postponing registration...\n");
           }
         }
       } else {
-        /* Connection lost or failed to connect, retry */
         subscribed = 0;
         registered = 0;
-        printf("[MQTT] Status update: Not connected. Retrying in %d seconds...\n", (int)(CONNECT_INTERVAL / CLOCK_SECOND));
         etimer_set(&connect_timer, CONNECT_INTERVAL);
       }
     }
 
-    /* ==============================================
-     * CONNECT TIMER LOOP — Verification & Connection
-     * ============================================== */
+    /* ========================================================
+     * CONNECT TIMER LOOP — Establish Connection to Broker
+     * ======================================================== */
     else if(ev == PROCESS_EVENT_TIMER && data == &connect_timer) {
-
       if(!mqtt_connected) {
         if(NETSTACK_ROUTING.node_is_reachable()) {
-          printf("[NET] Global RPL Network reachable! Establishing connection to MQTT broker...\n");
-          
+          printf("[NET] Network reachable! Connecting to MQTT broker...\n");
           mqtt_status_t status = mqtt_connect(&conn,
                                               MQTT_CLIENT_BROKER_IP_ADDR,
                                               1883, 
                                               60,
                                               MQTT_CLEAN_SESSION_ON);
           if(status != MQTT_STATUS_OK) {
-            printf("[MQTT] Connection initiation failed with status: %d\n", status);
             etimer_set(&connect_timer, CONNECT_INTERVAL);
           }
         } else {
-          printf("[NET] Routing path not ready yet. Retrying network diagnostics...\n");
           etimer_set(&connect_timer, CONNECT_INTERVAL);
         }
       }
     }
 
-    /* ==============================================
-     * SEND TIMER LOOP — Continuous Evaluation
-     * ============================================== */
+    /* ========================================================
+     * SEND TIMER LOOP — Read Vitals, Run TinyML, and Publish
+     * ======================================================== */
     else if(ev == PROCESS_EVENT_TIMER && data == &send_timer) {
 
-      /* Simulate vital reading variance constraints */
+      /* Simulate heart rate variance */
       heart_rate = 60 + (rand() % 60);
+      printf("\n--- Vitals processing metric: %d BPM ---\n", heart_rate);
 
-      printf("\n--- Telemetry Metrics Node Log ---\n");
-      printf("Heart Rate Processing Metric : %d BPM\n", heart_rate);
-
-      /* Update dynamic MaxHR feature */
+      /* Bind dynamic MaxHR feature */
       patient_profile[5] = (float)heart_rate;
 
-      /* Run TinyML model classification */
+      /* Run TinyML inference classification */
       float ml_output[2] = {0.0f, 0.0f};
       score(patient_profile, ml_output);
       int current_anomaly = (ml_output[1] >= 0.5f) ? 1 : 0;
 
-      printf("TinyML Anomaly Prob          : %d%%\n", (int)(ml_output[1] * 100.0f));
+      printf("TinyML Anomaly Prob: %d%%\n", (int)(ml_output[1] * 100.0f));
 
       if(current_anomaly == 1) {
-        /* LOCAL ANOMALY CLASSIFICATION TRIGGERED */
+        /* Local anomaly classified; turn red LED on */
         alert_active = 1;
         leds_off(LEDS_ALL);
         leds_on(LEDS_RED);
-        printf("CLASSIFICATION STATUS        : *** ANOMALY CLASSIFIED ***\n");
-        printf("[LED] RED ON - High Priority Mode\n");
+        printf("CLASSIFICATION STATUS: *** ANOMALY DETECTED ***\n");
 
-        /* MANDATORY ADAPTIVE MECHANISM 1: Rate Backoff modification */
+        /* Rate Adaptation (Mechanism 1): Throttle reporting rate to 20s */
         send_interval = 20 * CLOCK_SECOND;
-        printf("[ADAPTATION 1] Local network congestion risk mitigation. Throttle send rate to: 20s\n");
-
       } else {
-        /* NORMAL STATE RESTORED */
+        /* Safe environment; green LED on */
         alert_active = 0;
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
-        printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
-        printf("[LED] GREEN ON\n");
+        printf("CLASSIFICATION STATUS: NORMAL\n");
 
-        /* Revert to target nominal operation rate limits */
+        /* Revert to target nominal operation rate limits (5s) */
         send_interval = SEND_INTERVAL;
       }
 
-      /* Forward tracking update states upstream */
+      /* Transmit telemetry based on congestion conditions */
       if(mqtt_connected) {
-        /* MANDATORY ADAPTIVE MECHANISM 2: Value-Based reporting (Deadband Filter) */
+        /* Value-Based Suppression (Mechanism 2) deadband evaluation */
         if(congestion_mode && last_sent_heart_rate != -1 && last_sent_anomaly == current_anomaly) {
           int diff = abs(heart_rate - last_sent_heart_rate);
           if(diff < 4) {
-            printf("[ADAPTATION 2] Value stable (diff = %d BPM, anomaly=%d). Suppressing transmission to ease congestion.\n", diff, current_anomaly);
-            /* Skip publishing */
+            /* Vitals stable during congestion; suppress packet transmission */
+            printf("[ADAPTATION 2] Value stable (diff=%d). Suppressing publish.\n", diff);
           } else {
             publish_status(heart_rate, current_anomaly);
             last_sent_heart_rate = heart_rate;
@@ -476,6 +475,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         }
       }
 
+      /* Reload event timer */
       etimer_set(&send_timer, send_interval);
     }
   }
