@@ -53,6 +53,6 @@
 /* === Custom Radio Configuration Fix === */
 #define ROUTING_CONF_RPL_LITE 1
 #define IEEE802154_CONF_PANID 0xabcd
-#define DOT154_CONF_DEFAULT_CHANNEL 26
+#define IEEE802154_CONF_DEFAULT_CHANNEL 26
 
 #endif /* PROJECT_CONF_H_ */

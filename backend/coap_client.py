@@ -1,28 +1,34 @@
+import threading
 import asyncio
-import json
 from aiocoap import *
 
+_local = threading.local()
+
+async def get_coap_context():
+    if not hasattr(_local, "coap_context"):
+        _local.coap_context = await Context.create_client_context()
+    return _local.coap_context
+
 async def _async_coap_get(ip, path="health/status"):
-    protocol = await Context.create_client_context()
-    # Format the CoAP URI using the node's IPv6 address
+    protocol = await get_coap_context()
     uri = f"coap://[{ip}]/{path}"
-    request = Message(code=GET, uri=uri)
     try:
+        request = Message(code=GET, uri=uri)
         response = await protocol.request(request).response
         return response.payload.decode('utf-8')
     except Exception as e:
         return f"Error: {e}"
 
 async def _async_coap_post(ip, path="health/actuator", payload="mode=on"):
-    protocol = await Context.create_client_context()
+    protocol = await get_coap_context()
     uri = f"coap://[{ip}]/{path}"
-    request = Message(code=POST, payload=payload.encode('utf-8'), uri=uri)
     try:
+        request = Message(code=POST, payload=payload.encode('utf-8'), uri=uri)
         response = await protocol.request(request).response
-        # Return a readable string of the CoAP response code (e.g. 2.04 Changed)
         return str(response.code)
     except Exception as e:
         return f"Error: {e}"
+
 
 def coap_get_status(ip):
     """Synchronous wrapper to get health status from a node."""

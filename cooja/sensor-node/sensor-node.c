@@ -57,6 +57,17 @@ static struct etimer connect_timer;
 /* Global telemetry variables accessed by CoAP resources */
 int heart_rate = 0;
 int alert_active = 0;
+int congestion_mode = 0;
+static uint32_t seq_id = 0;
+static int last_sent_heart_rate = -1;
+static int last_sent_anomaly = -1;
+
+#include "heart_disease_model.h"
+
+/* Patient physiological profile for TinyML classification
+ * features: [Age, Sex, RestingBP, Cholesterol, FastingBS, MaxHR]
+ */
+static float patient_profile[6] = {55.0f, 1.0f, 120.0f, 200.0f, 0.0f, 75.0f};
 
 /* External CoAP resources definitions */
 extern coap_resource_t res_health_status;
@@ -81,8 +92,8 @@ mqtt_event_handler(struct mqtt_connection *m,
   case MQTT_EVENT_CONNECTED:
     printf("[MQTT] Connected to broker!\n");
     mqtt_connected = 1;
-    leds_single_on(LEDS_GREEN);
-    leds_single_off(LEDS_RED);
+    leds_on(LEDS_GREEN);
+    leds_off(LEDS_RED);
     break;
 
   case MQTT_EVENT_DISCONNECTED:
@@ -90,13 +101,13 @@ mqtt_event_handler(struct mqtt_connection *m,
     mqtt_connected = 0;
     subscribed = 0;
     registered = 0;
-    leds_single_off(LEDS_GREEN);
+    leds_off(LEDS_GREEN);
     break;
 
   case MQTT_EVENT_PUBLISH:
     /* Command received from cloud broker */
     printf("[MQTT] Command received from cloud!\n");
-    leds_single_on(LEDS_YELLOW);
+    leds_on(LEDS_YELLOW);
     break;
 
   case MQTT_EVENT_SUBACK:
@@ -137,13 +148,18 @@ mqtt_event_handler(struct mqtt_connection *m,
 static void
 publish_status(int heart_rate, int anomaly)
 {
+  /* Increment sequence ID on each transmission attempt */
+  seq_id++;
+
   /* Format payload directly into a JSON format string */
   snprintf(app_buffer, APP_BUFFER_SIZE,
     "{\"node\":\"%s\","
+    "\"seq\":%lu,"
     "\"heart_rate\":%d,"
     "\"anomaly\":%d,"
     "\"alert\":%d}",
     client_id,
+    (unsigned long)seq_id,
     heart_rate,
     anomaly,
     alert_active);
@@ -156,7 +172,7 @@ publish_status(int heart_rate, int anomaly)
                                       MQTT_RETAIN_OFF);
 
   if(status == MQTT_STATUS_OK) {
-    printf("[MQTT] Published status: %s\n", app_buffer);
+    printf("[MQTT] Published status (seq=%lu): %s\n", (unsigned long)seq_id, app_buffer);
   } else {
     printf("[MQTT] Status publish failed: %d\n", status);
   }
@@ -227,9 +243,47 @@ PROCESS_THREAD(sensor_node_process, ev, data)
            linkaddr_node_addr.u8[7]);
   printf("Client ID: %s\n", client_id);
 
+  /* Assign physiological profile based on Node ID for heterogeneous TinyML testing */
+  uint8_t node_id_last = linkaddr_node_addr.u8[7];
+  if(node_id_last == 2) {
+    // Patient 2: Elderly, high-risk male
+    patient_profile[0] = 72.0f; // Age
+    patient_profile[1] = 1.0f;  // Sex (M)
+    patient_profile[2] = 150.0f; // RestingBP (High)
+    patient_profile[3] = 270.0f; // Cholesterol (High)
+    patient_profile[4] = 1.0f;   // FastingBS (High)
+  } else if(node_id_last == 3) {
+    // Patient 3: Young, healthy female
+    patient_profile[0] = 28.0f; // Age
+    patient_profile[1] = 0.0f;  // Sex (F)
+    patient_profile[2] = 110.0f; // RestingBP
+    patient_profile[3] = 175.0f; // Cholesterol
+    patient_profile[4] = 0.0f;   // FastingBS
+  } else if(node_id_last == 4) {
+    // Patient 4: Middle-aged, moderate-risk male
+    patient_profile[0] = 48.0f; // Age
+    patient_profile[1] = 1.0f;  // Sex (M)
+    patient_profile[2] = 135.0f; // RestingBP
+    patient_profile[3] = 220.0f; // Cholesterol
+    patient_profile[4] = 0.0f;   // FastingBS
+  } else {
+    // Default / Patient 5+: Elderly female, moderate risk
+    patient_profile[0] = 65.0f; // Age
+    patient_profile[1] = 0.0f;  // Sex (F)
+    patient_profile[2] = 140.0f; // RestingBP
+    patient_profile[3] = 240.0f; // Cholesterol
+    patient_profile[4] = 1.0f;   // FastingBS
+  }
+  printf("TinyML Profile - Age: %d, Sex: %s, RestingBP: %d, Chol: %d, FastingBS: %d\n",
+         (int)patient_profile[0],
+         patient_profile[1] == 1.0f ? "Male" : "Female",
+         (int)patient_profile[2],
+         (int)patient_profile[3],
+         (int)patient_profile[4]);
+
   /* Clear active hardware indicators initially */
   leds_off(LEDS_ALL);
-  leds_single_on(LEDS_GREEN);
+  leds_on(LEDS_GREEN);
   printf("[LED] GREEN ON - Node initialized\n");
 
   /* Initialize system MQTT connection registry parameters */
@@ -254,7 +308,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
      * BUTTON PRESS LAYER (Visual Event Feedback)
      * ============================================== */
     if(ev == button_hal_press_event) {
-      leds_single_on(LEDS_YELLOW);
+      leds_on(LEDS_YELLOW);
       printf("\n[BUTTON] Patient pressing interaction button...\n");
     }
 
@@ -262,12 +316,12 @@ PROCESS_THREAD(sensor_node_process, ev, data)
      * BUTTON RELEASE LAYER — Manual Alarm Trigger
      * ============================================== */
     else if(ev == button_hal_release_event) {
-      leds_single_off(LEDS_YELLOW);
+      leds_off(LEDS_YELLOW);
 
       if(alert_active == 0) {
         alert_active = 1;
         leds_off(LEDS_ALL);
-        leds_single_on(LEDS_RED);
+        leds_on(LEDS_RED);
         printf("[EMERGENCY] Patient manually triggered alert sequence!\n");
         printf("[LED] RED ON - Emergency State Active!\n");
 
@@ -277,7 +331,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       } else {
         alert_active = 0;
         leds_off(LEDS_ALL);
-        leds_single_on(LEDS_GREEN);
+        leds_on(LEDS_GREEN);
         printf("[BUTTON] Alert state manually cancelled by operator.\n");
         printf("[LED] GREEN ON - Standard Monitoring Context\n");
       }
@@ -291,7 +345,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       if(btn->press_duration_seconds >= 3) {
         alert_active = 0;
         leds_off(LEDS_ALL);
-        leds_single_on(LEDS_GREEN);
+        leds_on(LEDS_GREEN);
         printf("[LONG PRESS] Safety system force reset executed successfully.\n");
         printf("[LED] GREEN ON - System parameters normalized\n");
       }
@@ -368,23 +422,33 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       printf("\n--- Telemetry Metrics Node Log ---\n");
       printf("Heart Rate Processing Metric : %d BPM\n", heart_rate);
 
-      if(heart_rate > 100) {
+      /* Update dynamic MaxHR feature */
+      patient_profile[5] = (float)heart_rate;
+
+      /* Run TinyML model classification */
+      float ml_output[2] = {0.0f, 0.0f};
+      score(patient_profile, ml_output);
+      int current_anomaly = (ml_output[1] >= 0.5f) ? 1 : 0;
+
+      printf("TinyML Anomaly Prob          : %d%%\n", (int)(ml_output[1] * 100.0f));
+
+      if(current_anomaly == 1) {
         /* LOCAL ANOMALY CLASSIFICATION TRIGGERED */
         alert_active = 1;
         leds_off(LEDS_ALL);
-        leds_single_on(LEDS_RED);
+        leds_on(LEDS_RED);
         printf("CLASSIFICATION STATUS        : *** ANOMALY CLASSIFIED ***\n");
         printf("[LED] RED ON - High Priority Mode\n");
 
         /* MANDATORY ADAPTIVE MECHANISM 1: Rate Backoff modification */
         send_interval = 20 * CLOCK_SECOND;
-        printf("[ADAPTATION] Local network congestion risk mitigation. Throttle send rate to: 20s\n");
+        printf("[ADAPTATION 1] Local network congestion risk mitigation. Throttle send rate to: 20s\n");
 
       } else {
         /* NORMAL STATE RESTORED */
         alert_active = 0;
         leds_off(LEDS_ALL);
-        leds_single_on(LEDS_GREEN);
+        leds_on(LEDS_GREEN);
         printf("CLASSIFICATION STATUS        : BALANCED OPERATIONAL ENVIRONMENT\n");
         printf("[LED] GREEN ON\n");
 
@@ -394,7 +458,22 @@ PROCESS_THREAD(sensor_node_process, ev, data)
 
       /* Forward tracking update states upstream */
       if(mqtt_connected) {
-        publish_status(heart_rate, (heart_rate > 100) ? 1 : 0);
+        /* MANDATORY ADAPTIVE MECHANISM 2: Value-Based reporting (Deadband Filter) */
+        if(congestion_mode && last_sent_heart_rate != -1 && last_sent_anomaly == current_anomaly) {
+          int diff = abs(heart_rate - last_sent_heart_rate);
+          if(diff < 4) {
+            printf("[ADAPTATION 2] Value stable (diff = %d BPM, anomaly=%d). Suppressing transmission to ease congestion.\n", diff, current_anomaly);
+            /* Skip publishing */
+          } else {
+            publish_status(heart_rate, current_anomaly);
+            last_sent_heart_rate = heart_rate;
+            last_sent_anomaly = current_anomaly;
+          }
+        } else {
+          publish_status(heart_rate, current_anomaly);
+          last_sent_heart_rate = heart_rate;
+          last_sent_anomaly = current_anomaly;
+        }
       }
 
       etimer_set(&send_timer, send_interval);

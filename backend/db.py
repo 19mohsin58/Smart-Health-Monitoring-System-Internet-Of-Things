@@ -40,6 +40,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS telemetry_history (
             id INT AUTO_INCREMENT PRIMARY KEY,
             node_id VARCHAR(50) NOT NULL,
+            seq INT DEFAULT 0,
             heart_rate INT NOT NULL,
             anomaly INT NOT NULL,
             alert INT NOT NULL,
@@ -47,6 +48,11 @@ def init_db():
             FOREIGN KEY (node_id) REFERENCES nodes_directory(node_id) ON DELETE CASCADE
         )
         """)
+        
+        # Check if 'seq' column exists, if not, add it
+        cursor.execute("SHOW COLUMNS FROM telemetry_history LIKE 'seq'")
+        if not cursor.fetchone():
+            cursor.execute("ALTER TABLE telemetry_history ADD COLUMN seq INT DEFAULT 0 AFTER node_id")
         
         # 3. Closed-loop control logs (actions executed based on alerts)
         cursor.execute("""
@@ -57,6 +63,17 @@ def init_db():
             action_taken VARCHAR(255) NOT NULL,
             executed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (node_id) REFERENCES nodes_directory(node_id) ON DELETE CASCADE
+        )
+        """)
+
+        # 4. Network performance metrics (for stress test evaluation)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS network_metrics (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            pdr FLOAT NOT NULL,
+            latency_ms FLOAT NOT NULL,
+            congestion_active INT NOT NULL
         )
         """)
         
@@ -71,3 +88,4 @@ def init_db():
 
 if __name__ == '__main__':
     init_db()
+

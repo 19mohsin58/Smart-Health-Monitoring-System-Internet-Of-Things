@@ -1,0 +1,11 @@
+CONTIKI_PROJECT = spammer
+all: $(CONTIKI_PROJECT)
+
+NRF52840_NATIVE_USB = 0
+
+MAKE_NET = MAKE_NET_IPV6
+MAKE_ROUTING = MAKE_ROUTING_RPL_LITE
+MAKE_MAC = MAKE_MAC_CSMA
+
+CONTIKI = /home/mohsin/contiki-ng
+include $(CONTIKI)/Makefile.include

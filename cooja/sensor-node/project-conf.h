@@ -14,4 +14,8 @@
 #define MQTT_LOG_CONF_LEVEL LOG_LEVEL_DBG
 #define LOG_CONF_LEVEL_TCPIP LOG_LEVEL_DBG
 
+/* Radio Configuration matching the Border Router */
+#define IEEE802154_CONF_PANID 0xabcd
+#define IEEE802154_CONF_DEFAULT_CHANNEL 26
+
 #endif /* PROJECT_CONF_H_ */
