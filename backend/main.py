@@ -1,3 +1,21 @@
+#!/usr/bin/env python3
+"""
+==============================================================================
+               Smart Health Backend Controller (main.py)
+==============================================================================
+
+Objective:
+  Launches the operator's shell CLI, starts background subscriber scripts,
+  and runs the performance monitoring thread that enforces closed-loop
+  congestion control.
+
+Functions & Logic:
+  - Command CLI Loop: Exposes list, telemetry, metrics, and remote control pings.
+  - Active Neighbors Filter: Queries only the nodes active in the last 1 minute.
+  - Congestion Detector Thread: Automates remote CoAP switches dynamically.
+==============================================================================
+"""
+
 import db
 import mqtt_client
 import coap_client
@@ -5,9 +23,11 @@ import threading
 import sys
 import time
 
+# Global variable to track whether network-wide congestion is currently active
 congestion_active = False
 
 def print_help():
+    """Prints the help menu with all available CLI commands."""
     print("\n--- Smart Health Control CLI ---")
     print("Available commands:")
     print("  list                       - List all registered nodes in the database directory")
@@ -20,7 +40,9 @@ def print_help():
     print("  exit / quit                - Close the application")
     print("---------------------------------")
 
+
 def cmd_metrics():
+    """Queries and displays the last 10 network metrics records from the MySQL database."""
     conn = db.get_connection()
     if conn is None:
         return
@@ -45,11 +67,15 @@ def cmd_metrics():
         cursor.close()
         conn.close()
 
+
 def metrics_background_worker():
+    """
+    Periodic background thread that measures network latency, PDR,
+    and updates the closed-loop congestion control state.
+    """
     global congestion_active
-    # print("[METRICS] Background performance metrics thread started.")
     
-    # Wait for nodes to register and start streaming before doing diagnostics
+    # Pause initially to allow nodes to boot and register
     time.sleep(15)
     
     while True:
@@ -60,7 +86,8 @@ def metrics_background_worker():
                 continue
                 
             cursor = conn.cursor()
-            # Only perform metrics diagnostics on nodes that have sent telemetry in the last 1 minute
+            
+            # Fetch nodes that have sent telemetry in the last 1 minute to avoid offline timeouts
             cursor.execute("""
                 SELECT DISTINCT node_id 
                 FROM telemetry_history 
@@ -70,6 +97,7 @@ def metrics_background_worker():
             cursor.close()
             conn.close()
             
+            # If no nodes have sent telemetry recently, skip evaluation
             if not nodes:
                 time.sleep(5)
                 continue
@@ -80,37 +108,40 @@ def metrics_background_worker():
                 if ip == "unknown":
                     continue
                     
-                # Measure CoAP GET latency
+                # Measure CoAP GET latency synchronously
                 start_time = time.time()
                 res = coap_client.coap_get_status(ip)
                 elapsed = (time.time() - start_time) * 1000.0
                 
+                # Check for timeouts or connection errors
                 if res is None or (isinstance(res, str) and res.startswith("Error")):
-                    latencies.append(2000.0) # 2 seconds timeout placeholder
+                    latencies.append(2000.0)  # Default 2-second timeout placeholder
                 else:
                     latencies.append(elapsed)
             
+            # Compute averages
             avg_latency = sum(latencies) / len(latencies) if latencies else 0.0
             avg_pdr = mqtt_client.get_average_pdr()
             
-            # Closed-loop adaptation check (reactive to PDR drop OR high latency)
+            # CLOSED-LOOP TRIGGER: Enable congestion mode if latency > 300ms or PDR < 85%
             if (avg_pdr < 85.0 or avg_latency > 300.0) and not congestion_active:
                 congestion_active = True
                 print(f"\n[CLOSED-LOOP CONGESTION SIGNAL] Network Congestion Detected (PDR: {avg_pdr:.1f}%, Latency: {avg_latency:.1f} ms). Remotely enabling Value-Based Reporting (Mechanism 2) on all nodes!")
-                # Alert the nodes
+                # Alert all nodes
                 for node_id in nodes:
                     ip = mqtt_client.node_id_to_ip(node_id)
                     coap_client.coap_set_actuator(ip, "congestion_on")
                     
+            # CLOSED-LOOP RECOVERY: Disable congestion mode if latency <= 200ms and PDR >= 90%
             elif (avg_pdr >= 90.0 and avg_latency <= 200.0) and congestion_active:
                 congestion_active = False
                 print(f"\n[CLOSED-LOOP CONGESTION CLEARED] Network Congestion Cleared (PDR: {avg_pdr:.1f}%, Latency: {avg_latency:.1f} ms). Disabling Value-Based Reporting on all nodes.")
-                # Revert the nodes
+                # Revert all nodes
                 for node_id in nodes:
                     ip = mqtt_client.node_id_to_ip(node_id)
                     coap_client.coap_set_actuator(ip, "congestion_off")
             
-            # Log to MySQL
+            # Write metrics payload log to MySQL
             conn = db.get_connection()
             if conn:
                 cursor = conn.cursor()
@@ -123,13 +154,15 @@ def metrics_background_worker():
                 conn.close()
                 
         except Exception as e:
-            # Silence thread print if it fails (e.g. at shutdown)
+            # Catch all thread exceptions to prevent thread exit
             pass
             
+        # Poll every 10 seconds
         time.sleep(10)
 
 
 def cmd_list():
+    """Queries and displays all registered nodes in the database directory."""
     conn = db.get_connection()
     if conn is None:
          return
@@ -150,7 +183,9 @@ def cmd_list():
         cursor.close()
         conn.close()
 
+
 def cmd_telemetry():
+    """Queries and displays the last 10 telemetry records from telemetry_history."""
     conn = db.get_connection()
     if conn is None:
          return
@@ -175,7 +210,9 @@ def cmd_telemetry():
         cursor.close()
         conn.close()
 
+
 def cmd_control_log():
+    """Queries and displays the last 10 closed-loop control log records from MySQL."""
     conn = db.get_connection()
     if conn is None:
          return
@@ -188,105 +225,99 @@ def cmd_control_log():
         LIMIT 10
         """)
         rows = cursor.fetchall()
-        print("\n=== Closed-Loop Control Actions Log (MySQL) ===")
-        print(f"{'Time':<20} | {'Node ID':<22} | {'Trigger Event':<35} | {'Action Taken':<40}")
-        print("-" * 125)
+        print("\n=== Recent Closed-Loop Control Decisions ===")
+        print(f"{'Time':<20} | {'Node ID':<22} | {'Trigger Event':<28} | {'Action Executed':<22}")
+        print("-" * 98)
         for row in rows:
-            print(f"{str(row[3]):<20} | {row[0]:<22} | {row[1]:<35} | {row[2]:<40}")
-        print("==================================================")
+            print(f"{str(row[3]):<20} | {row[0]:<22} | {row[1]:<28} | {row[2]:<22}")
+        print("============================================")
     except db.mysql.connector.Error as err:
         print(f"[DB ERROR] {err}")
     finally:
         cursor.close()
         conn.close()
 
+
 def main():
+    """Application entry point: initializes database, starts threads, and processes user inputs."""
     print("Starting Smart Health Hub...")
-    
-    # 1. Initialize DB schema
     db.init_db()
     
-    # 2. Start MQTT Subscriber in background thread
-    client = mqtt_client.start_mqtt_client()
-    if client is None:
-        print("[MQTT ERROR] Failed to start MQTT broker thread. Exiting.")
-        sys.exit(1)
-        
-    mqtt_thread = threading.Thread(target=client.loop_forever, daemon=True)
-    mqtt_thread.start()
-    print("[MQTT] Background subscriber thread started.")
+    # Initialize background MQTT subscriber thread
+    mqtt_client.start_mqtt_client()
     
-    # 2.5 Start Background Metrics Logger thread
+    # Start metrics background monitoring thread
     metrics_thread = threading.Thread(target=metrics_background_worker, daemon=True)
     metrics_thread.start()
     print("[METRICS] Background metrics logger thread started.")
     
-    # Small pause to let thread establish connection print
-    time.sleep(1)
-    
-    # 3. Launch CLI loop in the main thread
+    # Print the CLI options help menu
     print_help()
     
+    # Enter operator interactive input processing loop
     while True:
         try:
-            user_input = input("\nhealth-hub> ").strip()
-            if not user_input:
+            line = input("health-hub> ").strip()
+            if not line:
                 continue
-                
-            parts = user_input.split()
+            
+            parts = line.split()
             cmd = parts[0].lower()
             
-            if cmd in ("exit", "quit"):
+            if cmd in ['exit', 'quit']:
                 print("Exiting Smart Health Hub. Goodbye!")
                 break
                 
-            elif cmd == "help":
+            elif cmd == 'help':
                 print_help()
                 
-            elif cmd == "list":
+            elif cmd == 'list':
                 cmd_list()
                 
-            elif cmd == "telemetry":
+            elif cmd == 'telemetry':
                 cmd_telemetry()
                 
-            elif cmd == "control-log":
+            elif cmd == 'control-log':
                 cmd_control_log()
                 
-            elif cmd == "metrics":
+            elif cmd == 'metrics':
                 cmd_metrics()
                 
-            elif cmd == "get":
+            elif cmd == 'get':
+                # Direct CoAP GET status query to a node
                 if len(parts) < 2:
-                    print("Error: Missing node identifier (e.g. 'health-node-0002')")
+                    print("Usage: get <node_id>")
                     continue
                 node_id = parts[1]
                 ip = mqtt_client.node_id_to_ip(node_id)
-                print(f"[COAP] Sending GET status request to {node_id} at [{ip}]...")
-                result = coap_client.coap_get_status(ip)
-                print(f"[COAP RESPONSE] {result}")
+                if ip == "unknown":
+                    print(f"Unknown node ID: {node_id}")
+                    continue
+                print(f"Sending CoAP GET request to {node_id} at [{ip}]...")
+                res = coap_client.coap_get_status(ip)
+                print(f"Response: {res}")
                 
-            elif cmd == "alert":
-                if len(parts) < 3:
-                    print("Error: Usage: 'alert <node_id> <on|off>'")
+            elif cmd == 'alert':
+                # Direct CoAP POST alert modification command to a node
+                if len(parts) < 3 or parts[2].lower() not in ['on', 'off']:
+                    print("Usage: alert <node_id> <on|off>")
                     continue
                 node_id = parts[1]
                 mode = parts[2].lower()
-                if mode not in ("on", "off"):
-                    print("Error: Mode must be 'on' or 'off'")
-                    continue
                 ip = mqtt_client.node_id_to_ip(node_id)
-                print(f"[COAP] Sending POST actuator request to {node_id} ({ip}) with mode={mode}...")
-                result = coap_client.coap_set_actuator(ip, mode)
-                print(f"[COAP RESPONSE] Status: {result}")
+                if ip == "unknown":
+                    print(f"Unknown node ID: {node_id}")
+                    continue
+                print(f"Sending CoAP POST payload mode={mode} to {node_id} at [{ip}]...")
+                res = coap_client.coap_set_actuator(ip, mode)
+                print(f"Response Status: {res}")
                 
             else:
                 print(f"Unknown command: '{cmd}'. Type 'help' for options.")
                 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             print("\nExiting Smart Health Hub. Goodbye!")
             break
-        except Exception as e:
-            print(f"[CLI ERROR] {e}")
 
 
 if __name__ == '__main__':

@@ -4,16 +4,30 @@ import db
 import threading
 from coap_client import coap_set_actuator
 
-# To track packet counts and sequence statistics for PDR computation
+# ==============================================================================
+# MQTT Client Callback & Telemetry Handler (mqtt_client.py)
+# ==============================================================================
+# Objective:
+#   Runs in a background thread to manage MQTT broker connections, subscribe
+#   to incoming patient telemetry, compute packet stats (PDR), scrape IPv6
+#   addresses from the Border Router, and log telemetry inputs to MySQL.
+# ==============================================================================
+
+# Global sequence number tracker for computing packet delivery ratio (PDR)
 # Format: { node_id: { "received_seqs": set(), "first_seq": int, "last_seq": int, "pdr": float } }
 node_seq_tracker = {}
 
 def track_pdr(node_id, seq):
+    """
+    Tracks sequence gaps to calculate the Packet Delivery Ratio (PDR) for a node.
+    Detects reboots and sequence resets automatically.
+    """
     if not node_id:
         return 100.0
     
     global node_seq_tracker
     
+    # Initialize tracker structure if this is the first packet from the node
     if node_id not in node_seq_tracker:
         node_seq_tracker[node_id] = {
             "received_seqs": set(),
@@ -24,15 +38,17 @@ def track_pdr(node_id, seq):
     
     tracker = node_seq_tracker[node_id]
     
-    # If the node rebooted and sequence number reset
+    # If the sequence restarts (indicates mote rebooted/reflashed)
     if seq < tracker["last_seq"]:
         tracker["received_seqs"] = set()
         tracker["first_seq"] = seq
         tracker["last_seq"] = seq
         
+    # Append the sequence number to received set
     tracker["received_seqs"].add(seq)
     tracker["last_seq"] = max(tracker["last_seq"], seq)
     
+    # Expected vs. actual received count
     expected = tracker["last_seq"] - tracker["first_seq"] + 1
     received = len(tracker["received_seqs"])
     
@@ -45,18 +61,26 @@ def track_pdr(node_id, seq):
     return pdr
 
 def get_average_pdr():
+    """Computes the overall average PDR across all active nodes."""
     global node_seq_tracker
     if not node_seq_tracker:
         return 100.0
     pdrs = [tracker["pdr"] for tracker in node_seq_tracker.values()]
     return sum(pdrs) / len(pdrs)
 
-# Global IP cache to avoid repeated slow HTTP requests to the Border Router
+# Global IP cache to avoid repeated slow HTTP GET requests to the Border Router
 ip_cache = {}
 
 def get_real_ip_from_br(suffix):
+    """
+    Dynamic physical IP scraper:
+    Connects to the Border Router webserver at fd00::f6ce:364a:bcf9:e639,
+    extracts the active neighbor links, and searches for the IP matching the suffix.
+    """
     import urllib.request
     import re
+    
+    # Border Router physical address
     br_ips = ["fd00::f6ce:364a:bcf9:e639"]
     for br_ip in br_ips:
         try:
@@ -64,7 +88,7 @@ def get_real_ip_from_br(suffix):
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=1.0) as response:
                 html = response.read().decode('utf-8')
-                # Find all IPv6 addresses in HTML neighbors/routes
+                # Parse all IPv6 link addresses in page HTML
                 ips = re.findall(r'fd00::[0-9a-fA-F:]+', html)
                 for ip in ips:
                     if ip.endswith(suffix):
@@ -74,8 +98,10 @@ def get_real_ip_from_br(suffix):
     return None
 
 def node_id_to_ip(node_id):
-    """Maps Contiki-NG client ID to IPv6 address dynamically on physical hardware,
-    falling back to static Cooja-style mapping. Uses cache to prevent timeouts.
+    """
+    Maps node IDs (e.g. 'health-node-4d7c') to IPv6 addresses.
+    Utilizes dynamic Border Router lookup first, falling back to a safe
+    formatting model to prevent parsing crashes in CoAP libraries.
     """
     global ip_cache
     if node_id in ip_cache:
@@ -83,9 +109,9 @@ def node_id_to_ip(node_id):
 
     try:
         parts = node_id.split("-")
-        suffix = parts[-1]  # E.g. "4d7c" or "0002"
+        suffix = parts[-1]  # Suffix e.g. '4d7c' or '0002'
         
-        # Try dynamic lookup first
+        # Try scraping dynamic physical IP from Border Router
         real_ip = get_real_ip_from_br(suffix)
         if real_ip:
             ip_cache[node_id] = real_ip
@@ -94,21 +120,25 @@ def node_id_to_ip(node_id):
         # Fallback to Cooja-style static mapping for compatibility (preserving low IDs for Cooja)
         val = int(suffix, 16)
         if val < 256:
+            # Low values (e.g. 2 -> fd00::202:2:2:2) match Cooja node topologies
             return f"fd00::20{val}:{val}:{val}:{val}"
         else:
+            # High hexadecimal values (MAC addresses) are mapped to format-safe IPv6 addresses
             return f"fd00::2000:{suffix}:{suffix}:{suffix}"
     except Exception:
         return "unknown"
 
 def on_connect(client, userdata, flags, rc):
+    """Callback executed when the client establishes connection with broker."""
     print(f"[MQTT] Connected to broker with result code {rc}")
+    # Subscribe to health telemetry wildcard topic
     client.subscribe("health/node/#")
 
 def on_message(client, userdata, msg):
+    """Decodes JSON packets and updates MySQL databases accordingly."""
     try:
         topic = msg.topic
         payload_str = msg.payload.decode('utf-8')
-        # print(f"[MQTT RECEIVED] {topic} : {payload_str}")
         
         try:
             data = json.loads(payload_str)
@@ -123,7 +153,7 @@ def on_message(client, userdata, msg):
         cursor = conn.cursor()
         try:
             if topic == "health/node/register":
-                # 1. Update the Nodes Directory (Directory of sensors and actuators)
+                # Handle Dynamic Registration Topic
                 node_id = data.get("node")
                 node_type = data.get("type", "sensor")
                 domain = data.get("domain", "smart-health")
@@ -141,17 +171,17 @@ def on_message(client, userdata, msg):
                 print(f"[MQTT] Registered node {node_id} (IP: {node_id_to_ip(node_id)}) in directory.")
                 
             elif topic == "health/node/status":
-                # 2. Insert into Telemetry History
+                # Handle Vitals Status Telemetry Topic
                 node_id = data.get("node")
                 seq = data.get("seq", 0)
                 heart_rate = data.get("heart_rate")
                 anomaly = data.get("anomaly")
                 alert = data.get("alert")
                 
-                # Compute/Track PDR
+                # Perform PDR calculation
                 pdr = track_pdr(node_id, seq)
                 
-                # Ensure the node exists in directory first (in case registration was missed)
+                # Auto-register directory if missed
                 cursor.execute("SELECT node_id FROM nodes_directory WHERE node_id = %s", (node_id,))
                 if cursor.fetchone() is None:
                     cursor.execute("""
@@ -160,20 +190,19 @@ def on_message(client, userdata, msg):
                     """, (node_id,))
                     conn.commit()
                     
+                # Store telemetry record in MySQL history
                 cursor.execute("""
                 INSERT INTO telemetry_history (node_id, seq, heart_rate, anomaly, alert)
                 VALUES (%s, %s, %s, %s, %s)
                 """, (node_id, seq, heart_rate, anomaly, alert))
                 conn.commit()
                 
-                # 3. CLOSED-LOOP CONTROL LOGIC
-                # If an anomaly is detected, perform backend evaluation and log the control action
+                # Dynamic Closed-Loop Decision: If anomaly detected, force Warning RED LED
                 if anomaly == 1:
                     ip = node_id_to_ip(node_id)
                     trigger_event = f"Anomaly: High Heart Rate ({heart_rate} BPM)"
                     action_taken = f"Auto-latch Red Warning LED via CoAP"
                     
-                    # Insert log
                     cursor.execute("""
                     INSERT INTO closed_loop_control_log (node_id, trigger_event, action_taken)
                     VALUES (%s, %s, %s)
@@ -181,16 +210,15 @@ def on_message(client, userdata, msg):
                     conn.commit()
                     
                     print(f"[CLOSED-LOOP] Automatic anomaly detected on {node_id} ({heart_rate} BPM). Latching LED to RED.")
-                    # We can also actuate the node remotely to ensure it remains in emergency state (spawn in background thread)
+                    # Spawn asynchronous thread to trigger remote CoAP command
                     threading.Thread(target=coap_set_actuator, args=(ip, "on"), daemon=True).start()
                     
             elif topic == "health/node/alert":
-                # 4. Handle emergency button press alerts
+                # Handle Button Emergency Alerts Topic
                 node_id = data.get("node")
                 alert_type = data.get("type", "EMERGENCY")
                 message = data.get("message", "Patient pressed button!")
                 
-                # Log as a control trigger
                 trigger_event = f"Manual Alert: {message}"
                 action_taken = "Logged emergency alert, notified nurses, and actuated RED indicator"
                 
@@ -202,33 +230,30 @@ def on_message(client, userdata, msg):
                 
                 print(f"[CLOSED-LOOP] EMERGENCY alert received from {node_id}: {message}")
                 
-        except Exception as e:
-             import traceback
-             print(f"[DB/CONTROL ERROR] {e}")
-             traceback.print_exc()
+        except db.mysql.connector.Error as err:
+            print(f"[DB ERROR] {err}")
         finally:
-             cursor.close()
-             conn.close()
-             
+            cursor.close()
+            conn.close()
+            
     except Exception as e:
-        import traceback
-        print(f"[MQTT ON_MESSAGE EXCEPTION] {e}")
-        traceback.print_exc()
+        print(f"[MQTT CLIENT ERROR] {e}")
 
-
-def on_disconnect(client, userdata, rc):
-    print(f"[MQTT] Disconnected from broker with reason code: {rc}")
-
-def start_mqtt_client():
+def run_mqtt_loop():
+    """Connects to the local MQTT broker and starts the background listener loop."""
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
-    client.on_disconnect = on_disconnect
     
     try:
+        # Connect to local Mosquitto broker running on localhost
         client.connect("127.0.0.1", 1883, 60)
-        return client
+        client.loop_forever()
     except Exception as e:
-        print(f"[MQTT ERROR] Could not connect to Mosquitto: {e}")
-        return None
+        print(f"[MQTT ERROR] Failed to connect: {e}")
 
+def start_mqtt_client():
+    """Spawns the MQTT loop in a separate daemon background thread."""
+    t = threading.Thread(target=run_mqtt_loop, daemon=True)
+    t.start()
+    print("[MQTT] Background subscriber thread started.")
