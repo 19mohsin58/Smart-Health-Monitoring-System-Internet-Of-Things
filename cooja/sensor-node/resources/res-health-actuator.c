@@ -18,6 +18,8 @@
 
 /* Expose global variables declared in sensor-node.c */
 extern int alert_active;
+extern int model_alert_active;
+extern int user_alert_active;
 extern int congestion_mode;
 
 /* Log Configuration */
@@ -55,6 +57,7 @@ res_post_put_handler(coap_message_t *request, coap_message_t *response, uint8_t 
 
     /* Remotely force the Red Warning LED and alert state ON */
     if(strncmp(mode, "on", len) == 0) {
+      user_alert_active = 1;
       alert_active = 1;
       leds_off(LEDS_ALL);
       leds_on(LEDS_RED);
@@ -63,6 +66,8 @@ res_post_put_handler(coap_message_t *request, coap_message_t *response, uint8_t 
     } 
     /* Remotely clear the alert state and force the Green LED ON */
     else if(strncmp(mode, "off", len) == 0) {
+      model_alert_active = 0;
+      user_alert_active = 0;
       alert_active = 0;
       leds_off(LEDS_ALL);
       leds_on(LEDS_GREEN);

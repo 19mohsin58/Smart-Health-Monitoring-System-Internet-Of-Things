@@ -72,6 +72,8 @@ static clock_time_t send_interval = SEND_INTERVAL;
 /* Vitals & Adaptability State Variables */
 int heart_rate = 0;              /* Simulated patient heart rate */
 int alert_active = 0;            /* Local emergency alert status (1=Active) */
+int model_alert_active = 0;      /* TinyML classifier alert state */
+int user_alert_active = 0;       /* Physical button click alert state */
 int congestion_mode = 0;         /* Value-Based suppression mode activated (1=Active) */
 static uint32_t seq_id = 0;      /* Monotonically increasing sequence tracker */
 static int last_sent_heart_rate = -1; /* Previous value to calculate deadband difference */
@@ -223,7 +225,7 @@ publish_alert(const char *type, const char *message)
                                       ALERT_TOPIC,
                                       (uint8_t *)app_buffer,
                                       strlen(app_buffer),
-                                      MQTT_QOS_LEVEL_0,
+                                      MQTT_QOS_LEVEL_1,
                                       MQTT_RETAIN_OFF);
 
   if(status == MQTT_STATUS_OK) {
@@ -342,7 +344,8 @@ PROCESS_THREAD(sensor_node_process, ev, data)
      * SHORT PRESS INTERACTION — Manual Alert Activation
      * ======================================================== */
     if(ev == button_hal_release_event) {
-      alert_active = !alert_active;
+      user_alert_active = !user_alert_active;
+      alert_active = (model_alert_active || user_alert_active);
       if(alert_active) {
         leds_off(LEDS_ALL);
         leds_on(LEDS_RED);
@@ -361,6 +364,8 @@ PROCESS_THREAD(sensor_node_process, ev, data)
     else if(ev == button_hal_periodic_event) {
       btn = (button_hal_button_t *)data;
       if(btn->press_duration_seconds >= 3) {
+        user_alert_active = 0;
+        model_alert_active = 0;
         alert_active = 0;
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
@@ -436,22 +441,37 @@ PROCESS_THREAD(sensor_node_process, ev, data)
       printf("TinyML Anomaly Prob: %d%%\n", (int)(ml_output[1] * 100.0f));
 
       if(current_anomaly == 1) {
-        /* Local anomaly classified; turn red LED on */
-        alert_active = 1;
+        model_alert_active = 1;
+        printf("CLASSIFICATION STATUS: *** ANOMALY DETECTED ***\n");
+      } else {
+        model_alert_active = 0;
+        printf("CLASSIFICATION STATUS: NORMAL\n");
+      }
+
+      /* Re-evaluate overall alert status via OR logic */
+      alert_active = (model_alert_active || user_alert_active);
+
+      if(alert_active) {
+        /* Emergency alarm active; turn Red LED on */
         leds_off(LEDS_ALL);
         leds_on(LEDS_RED);
-        printf("CLASSIFICATION STATUS: *** ANOMALY DETECTED ***\n");
-
-        /* Rate Adaptation (Mechanism 1): Throttle reporting rate to 20s */
-        send_interval = 20 * CLOCK_SECOND;
       } else {
-        /* Safe environment; green LED on */
-        alert_active = 0;
+        /* Safe environment; turn Green LED on */
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
-        printf("CLASSIFICATION STATUS: NORMAL\n");
+      }
 
-        /* Revert to target nominal operation rate limits (5s) */
+      /* 
+       * Rate Adaptation (Mechanism 1):
+       * - If patient manually triggered alert (user_alert_active == 1), we MUST monitor high frequency (5s).
+       * - If it's a model-only anomaly (model_alert_active == 1), we back off to 20s.
+       * - Otherwise, nominal 5s.
+       */
+      if(user_alert_active) {
+        send_interval = SEND_INTERVAL;
+      } else if(model_alert_active) {
+        send_interval = 20 * CLOCK_SECOND;
+      } else {
         send_interval = SEND_INTERVAL;
       }
 

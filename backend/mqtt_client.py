@@ -2,6 +2,7 @@ import paho.mqtt.client as mqtt
 import json
 import db
 import threading
+import time
 from coap_client import coap_set_actuator
 
 # ==============================================================================
@@ -14,8 +15,12 @@ from coap_client import coap_set_actuator
 # ==============================================================================
 
 # Global sequence number tracker for computing packet delivery ratio (PDR)
-# Format: { node_id: { "received_seqs": set(), "first_seq": int, "last_seq": int, "pdr": float } }
+# Format: { node_id: { "received_seqs": set(), "first_seq": int, "last_seq": int, "pdr": float, "last_seen": float } }
 node_seq_tracker = {}
+
+# Locks to synchronize concurrent thread access to shared global states
+seq_tracker_lock = threading.Lock()
+ip_cache_lock = threading.Lock()
 
 def track_pdr(node_id, seq):
     """
@@ -27,46 +32,54 @@ def track_pdr(node_id, seq):
     
     global node_seq_tracker
     
-    # Initialize tracker structure if this is the first packet from the node
-    if node_id not in node_seq_tracker:
-        node_seq_tracker[node_id] = {
-            "received_seqs": set(),
-            "first_seq": seq,
-            "last_seq": seq,
-            "pdr": 100.0
-        }
-    
-    tracker = node_seq_tracker[node_id]
-    
-    # If the sequence restarts (indicates mote rebooted/reflashed)
-    if seq < tracker["last_seq"]:
-        tracker["received_seqs"] = set()
-        tracker["first_seq"] = seq
-        tracker["last_seq"] = seq
+    with seq_tracker_lock:
+        if node_id not in node_seq_tracker:
+            node_seq_tracker[node_id] = {
+                "received_seqs": set(),
+                "first_seq": seq,
+                "last_seq": seq,
+                "pdr": 100.0,
+                "last_seen": time.time()
+            }
         
-    # Append the sequence number to received set
-    tracker["received_seqs"].add(seq)
-    tracker["last_seq"] = max(tracker["last_seq"], seq)
-    
-    # Expected vs. actual received count
-    expected = tracker["last_seq"] - tracker["first_seq"] + 1
-    received = len(tracker["received_seqs"])
-    
-    if expected <= 0:
-        pdr = 100.0
-    else:
-        pdr = (received / expected) * 100.0
+        tracker = node_seq_tracker[node_id]
+        tracker["last_seen"] = time.time()
         
-    tracker["pdr"] = pdr
-    return pdr
+        # If the sequence restarts (indicates mote rebooted/reflashed)
+        if seq < tracker["last_seq"]:
+            tracker["received_seqs"] = set()
+            tracker["first_seq"] = seq
+            tracker["last_seq"] = seq
+            
+        # Append the sequence number to received set
+        tracker["received_seqs"].add(seq)
+        tracker["last_seq"] = max(tracker["last_seq"], seq)
+        
+        # Expected vs. actual received count
+        expected = tracker["last_seq"] - tracker["first_seq"] + 1
+        received = len(tracker["received_seqs"])
+        
+        if expected <= 0:
+            pdr = 100.0
+        else:
+            pdr = (received / expected) * 100.0
+            
+        tracker["pdr"] = pdr
+        return pdr
 
 def get_average_pdr():
-    """Computes the overall average PDR across all active nodes."""
+    """Computes the overall average PDR across active nodes within the last minute."""
     global node_seq_tracker
-    if not node_seq_tracker:
-        return 100.0
-    pdrs = [tracker["pdr"] for tracker in node_seq_tracker.values()]
-    return sum(pdrs) / len(pdrs)
+    with seq_tracker_lock:
+        now = time.time()
+        active_pdrs = []
+        for tracker in node_seq_tracker.values():
+            # Only include nodes active in the last 1 minute (60 seconds)
+            if now - tracker.get("last_seen", 0) <= 60.0:
+                active_pdrs.append(tracker["pdr"])
+        if not active_pdrs:
+            return 100.0
+        return sum(active_pdrs) / len(active_pdrs)
 
 # Global IP cache to avoid repeated slow HTTP GET requests to the Border Router
 ip_cache = {}
@@ -104,8 +117,9 @@ def node_id_to_ip(node_id):
     formatting model to prevent parsing crashes in CoAP libraries.
     """
     global ip_cache
-    if node_id in ip_cache:
-        return ip_cache[node_id]
+    with ip_cache_lock:
+        if node_id in ip_cache:
+            return ip_cache[node_id]
 
     try:
         parts = node_id.split("-")
@@ -113,18 +127,20 @@ def node_id_to_ip(node_id):
         
         # Try scraping dynamic physical IP from Border Router
         real_ip = get_real_ip_from_br(suffix)
-        if real_ip:
-            ip_cache[node_id] = real_ip
-            return real_ip
-            
-        # Fallback to Cooja-style static mapping for compatibility (preserving low IDs for Cooja)
-        val = int(suffix, 16)
-        if val < 256:
-            # Low values (e.g. 2 -> fd00::202:2:2:2) match Cooja node topologies
-            return f"fd00::20{val}:{val}:{val}:{val}"
-        else:
-            # High hexadecimal values (MAC addresses) are mapped to format-safe IPv6 addresses
-            return f"fd00::2000:{suffix}:{suffix}:{suffix}"
+        with ip_cache_lock:
+            if real_ip:
+                ip_cache[node_id] = real_ip
+                return real_ip
+                
+            # Fallback to Cooja-style static mapping for compatibility (preserving low IDs for Cooja)
+            val = int(suffix, 16)
+            if val < 256:
+                # Low values (e.g. 2 -> fd00::202:2:2:2) match Cooja node topologies
+                ip_cache[node_id] = f"fd00::20{val}:{val}:{val}:{val}"
+            else:
+                # High hexadecimal values (MAC addresses) are mapped to format-safe IPv6 addresses
+                ip_cache[node_id] = f"fd00::2000:{suffix}:{suffix}:{suffix}"
+            return ip_cache[node_id]
     except Exception:
         return "unknown"
 

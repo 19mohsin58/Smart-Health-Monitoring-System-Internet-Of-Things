@@ -6,40 +6,59 @@ from aiocoap import *
 # CoAP Client Wrapper Interfaces (coap_client.py)
 # ==============================================================================
 # Objective:
-#   Provides synchronous wrapper functions to interface with aiocoap,
-#   allowing multi-threaded backend workers to perform GET and POST
-#   operations over IPv6 without crashing on malformed addresses.
+#   Provides synchronous wrapper functions to interface with aiocoap using a
+#   single thread-safe background event loop and context. This design prevents
+#   socket leaks, thread event loop leaks, and port exhaustion.
 # ==============================================================================
 
-# Thread-local storage to cache CoAP client contexts per background thread
-_local = threading.local()
+# Shared single background event loop and CoAP context
+_loop = None
+_context = None
+_loop_thread = None
+_loop_ready = threading.Event()
 
-async def get_coap_context():
-    """Retrieves or instantiates a cached CoAP client context for the calling thread."""
-    if not hasattr(_local, "coap_context"):
-        _local.coap_context = await Context.create_client_context()
-    return _local.coap_context
+def _run_background_loop():
+    """Initializes and runs the permanent background asyncio event loop."""
+    global _loop, _context
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    
+    # Initialize a single shared CoAP client context inside the event loop
+    _context = _loop.run_until_complete(Context.create_client_context())
+    
+    # Signal main thread that loop is fully initialized
+    _loop_ready.set()
+    
+    # Keep loop running forever to process background coroutines
+    _loop.run_forever()
+
+def start_coap_client():
+    """Spawns the background loop thread and waits for initialization."""
+    global _loop_thread
+    if _loop_thread is None:
+        _loop_thread = threading.Thread(target=_run_background_loop, daemon=True)
+        _loop_thread.start()
+        _loop_ready.wait()  # Block calling thread until background loop is ready
+
+# Automatically start the background CoAP loop on module load
+start_coap_client()
 
 async def _async_coap_get(ip, path="health/status"):
     """Performs an asynchronous CoAP GET request to query patient status."""
-    protocol = await get_coap_context()
     uri = f"coap://[{ip}]/{path}"
     try:
-        # Wrap message construction to capture malformed URL formatting exceptions
         request = Message(code=GET, uri=uri)
-        response = await protocol.request(request).response
+        response = await _context.request(request).response
         return response.payload.decode('utf-8')
     except Exception as e:
         return f"Error: {e}"
 
 async def _async_coap_post(ip, path="health/actuator", payload="mode=on"):
     """Performs an asynchronous CoAP POST request to modify actuator/alarm modes."""
-    protocol = await get_coap_context()
     uri = f"coap://[{ip}]/{path}"
     try:
-        # Wrap message construction to capture malformed URL formatting exceptions
         request = Message(code=POST, payload=payload.encode('utf-8'), uri=uri)
-        response = await protocol.request(request).response
+        response = await _context.request(request).response
         return str(response.code)
     except Exception as e:
         return f"Error: {e}"
@@ -48,41 +67,19 @@ async def _async_coap_post(ip, path="health/actuator", payload="mode=on"):
 def coap_get_status(ip):
     """
     Synchronous wrapper to get health status from a node.
-    Automatically handles event loop mapping for thread safety.
+    Dispatches task to the shared background event loop thread-safely.
     """
-    try:
-        # Check if an event loop exists for this thread
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        # If not, create and mount a new thread event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-    if loop.is_running():
-        # If the loop is already running, schedule the task from threadsafe executor
-        future = asyncio.run_coroutine_threadsafe(_async_coap_get(ip), loop)
-        return future.result()
-    else:
-        # Otherwise, block until the loop executes the async query
-        return loop.run_until_complete(_async_coap_get(ip))
+    future = asyncio.run_coroutine_threadsafe(_async_coap_get(ip), _loop)
+    return future.result()
 
 def coap_set_actuator(ip, mode):
     """
     Synchronous wrapper to set actuator mode (on/off/congestion_on/congestion_off) on a node.
-    Automatically handles event loop mapping for thread safety.
+    Dispatches task to the shared background event loop thread-safely.
     """
     payload = f"mode={mode}"
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-    if loop.is_running():
-        future = asyncio.run_coroutine_threadsafe(_async_coap_post(ip, payload=payload), loop)
-        return future.result()
-    else:
-        return loop.run_until_complete(_async_coap_post(ip, payload=payload))
+    future = asyncio.run_coroutine_threadsafe(_async_coap_post(ip, payload=payload), _loop)
+    return future.result()
 
 if __name__ == '__main__':
     # Local CLI diagnostics test
