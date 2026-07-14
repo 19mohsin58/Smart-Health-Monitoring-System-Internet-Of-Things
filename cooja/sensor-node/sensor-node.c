@@ -288,7 +288,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
                      linkaddr_node_addr.u8[LINKADDR_SIZE - 1]);
 
   /* Profile Customization mappings based on MAC addresses */
-  if (id_val == 0x0002) {
+  if (id_val == 0x0002 || id_val == 0xd8c7 || id_val == 0x92a7) {
     /* Patient 2: Elderly High Risk Male */
     patient_profile[0] = 72.0f;  /* Age */
     patient_profile[1] = 1.0f;   /* Sex (1=Male) */
