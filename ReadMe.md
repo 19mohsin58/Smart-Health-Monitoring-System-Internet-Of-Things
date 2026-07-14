@@ -330,8 +330,7 @@ cloud CoAP directory server on startup.
 - Professor's lab used this exact approach (Lab 02 Vallati)
 
 **Dataset:**
-- Source: Kaggle — [Heart Rate Anomaly Dataset]
-  (https://www.kaggle.com/)
+- Source: Kaggle — [Heart Rate Anomaly Dataset](https://www.kaggle.com/datasets/fedesoriano/heart-failure-prediction)
 - Features used:
   - `heart_rate` (BPM)
   - `spo2` (blood oxygen %)
