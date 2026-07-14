@@ -289,33 +289,33 @@ PROCESS_THREAD(sensor_node_process, ev, data)
 
   /* Profile Customization mappings based on MAC addresses */
   if (id_val == 0x0002 || id_val == 0xd8c7) {
-    /* Patient 2: Elderly High Risk Male */
+    /* Patient 2: Elderly High Risk Male (Always Red / Anomaly) */
     patient_profile[0] = 72.0f;  /* Age */
     patient_profile[1] = 1.0f;   /* Sex (1=Male) */
     patient_profile[2] = 150.0f; /* Resting BP */
     patient_profile[3] = 270.0f; /* Cholesterol */
     patient_profile[4] = 1.0f;   /* Fasting BS (1=High) */
   } else if (id_val == 0x0003 || id_val == 0x92a7) {
-    /* Patient 3: Young Low Risk Female */
-    patient_profile[0] = 28.0f;
-    patient_profile[1] = 0.0f;   /* Sex (0=Female) */
-    patient_profile[2] = 110.0f;
-    patient_profile[3] = 175.0f;
-    patient_profile[4] = 0.0f;
+    /* Patient 3: Dynamic Young Male (Toggles at 110 BPM) */
+    patient_profile[0] = 30.0f;  /* Age */
+    patient_profile[1] = 1.0f;   /* Sex (1=Male) */
+    patient_profile[2] = 120.0f; /* Resting BP */
+    patient_profile[3] = 220.0f; /* Cholesterol */
+    patient_profile[4] = 0.0f;   /* Fasting BS */
   } else if (id_val == 0x0004 || id_val == 0x4d7c) {
-    /* Patient 4: Middle-aged moderate risk male */
-    patient_profile[0] = 48.0f;
-    patient_profile[1] = 1.0f;
-    patient_profile[2] = 135.0f;
-    patient_profile[3] = 220.0f;
-    patient_profile[4] = 0.0f;
+    /* Patient 4: Dynamic Young Male (Toggles at 110 BPM) */
+    patient_profile[0] = 30.0f;  /* Age */
+    patient_profile[1] = 1.0f;   /* Sex (1=Male) */
+    patient_profile[2] = 120.0f; /* Resting BP */
+    patient_profile[3] = 220.0f; /* Cholesterol */
+    patient_profile[4] = 0.0f;   /* Fasting BS */
   } else {
-    /* Default fallback profile (Patient 5): Elderly moderate risk female (matches f869) */
-    patient_profile[0] = 65.0f;
-    patient_profile[1] = 0.0f;
-    patient_profile[2] = 140.0f;
-    patient_profile[3] = 240.0f;
-    patient_profile[4] = 1.0f;
+    /* Patient 5 / Default: Dynamic Young Female (Matches f869, Toggles at 106 BPM) */
+    patient_profile[0] = 30.0f;  /* Age */
+    patient_profile[1] = 0.0f;   /* Sex (0=Female) */
+    patient_profile[2] = 150.0f; /* Resting BP */
+    patient_profile[3] = 260.0f; /* Cholesterol */
+    patient_profile[4] = 0.0f;   /* Fasting BS */
   }
 
   /* Safe Integer Cast parsing to avoid floats in libc printf blocks */
