@@ -75,6 +75,7 @@ int alert_active = 0;            /* Local emergency alert status (1=Active) */
 int model_alert_active = 0;      /* TinyML classifier alert state */
 int user_alert_active = 0;       /* Physical button click alert state */
 int congestion_mode = 0;         /* Value-Based suppression mode activated (1=Active) */
+static int long_press_triggered = 0; /* Guard flag to consume release events after long press reset */
 static uint32_t seq_id = 0;      /* Monotonically increasing sequence tracker */
 static int last_sent_heart_rate = -1; /* Previous value to calculate deadband difference */
 static int last_sent_anomaly = -1;    /* Previous anomaly value to monitor status changes */
@@ -341,20 +342,32 @@ PROCESS_THREAD(sensor_node_process, ev, data)
     PROCESS_YIELD(); /* Suspend thread execution until an event is posted */
 
     /* ========================================================
+     * BUTTON PRESS EVENT — Reset long press trigger guard
+     * ======================================================== */
+    if(ev == button_hal_press_event) {
+      long_press_triggered = 0;
+    }
+
+    /* ========================================================
      * SHORT PRESS INTERACTION — Manual Alert Activation
      * ======================================================== */
-    if(ev == button_hal_release_event) {
-      user_alert_active = !user_alert_active;
-      alert_active = (model_alert_active || user_alert_active);
-      if(alert_active) {
-        leds_off(LEDS_ALL);
-        leds_on(LEDS_RED);
-        printf("[BUTTON] Manual alert activated!\n");
-        publish_alert("EMERGENCY", "Patient pressed emergency button!");
+    else if(ev == button_hal_release_event) {
+      if(long_press_triggered) {
+        /* Consume the release event of a long press safety reset without re-toggling alert */
+        long_press_triggered = 0;
       } else {
-        leds_off(LEDS_ALL);
-        leds_on(LEDS_GREEN);
-        printf("[BUTTON] Manual alert deactivated.\n");
+        user_alert_active = !user_alert_active;
+        alert_active = (model_alert_active || user_alert_active);
+        if(alert_active) {
+          leds_off(LEDS_ALL);
+          leds_on(LEDS_RED);
+          printf("[BUTTON] Manual alert activated!\n");
+          publish_alert("EMERGENCY", "Patient pressed emergency button!");
+        } else {
+          leds_off(LEDS_ALL);
+          leds_on(LEDS_GREEN);
+          printf("[BUTTON] Manual alert deactivated.\n");
+        }
       }
     }
 
@@ -367,6 +380,7 @@ PROCESS_THREAD(sensor_node_process, ev, data)
         user_alert_active = 0;
         model_alert_active = 0;
         alert_active = 0;
+        long_press_triggered = 1; /* Latch flag to swallow the release event */
         leds_off(LEDS_ALL);
         leds_on(LEDS_GREEN);
         printf("[LONG PRESS] Safety system force reset executed.\n");
