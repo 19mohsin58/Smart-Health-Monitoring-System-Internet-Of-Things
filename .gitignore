@@ -11,3 +11,6 @@ cooja/border-router/build/
 cooja/spammer/build/
 *.cooja
 *.mote
+
+# Ignore LaTeX report source files
+report/
